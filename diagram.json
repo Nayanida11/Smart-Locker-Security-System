@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "author": "Smart Lock v3 - OTP",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-arduino-uno",
+      "id": "uno",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-membrane-keypad",
+      "id": "keypad1",
+      "top": -120,
+      "left": 340,
+      "attrs": {
+        "columns": "4",
+        "keys": ["1","2","3","A","4","5","6","B","7","8","9","C","*","0","#","D"]
+      }
+    },
+    {
+      "type": "wokwi-lcd1602",
+      "id": "lcd1",
+      "top": -250,
+      "left": -100,
+      "attrs": { "pins": "i2c" }
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo1",
+      "top": -250,
+      "left": 340,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz1",
+      "top": 260,
+      "left": -150,
+      "attrs": { "volume": "1.0" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 260,
+      "left": -50,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led2",
+      "top": 260,
+      "left": 30,
+      "attrs": { "color": "green" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led3",
+      "top": 260,
+      "left": 110,
+      "attrs": { "color": "yellow" }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "sw1",
+      "top": 260,
+      "left": 220,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-pir-motion-sensor",
+      "id": "pir1",
+      "top": 260,
+      "left": 350,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    ["lcd1:GND", "uno:GND.1", "black", ["v20", "h-10"]],
+    ["lcd1:VCC", "uno:5V", "red", ["v30", "h0"]],
+    ["lcd1:SDA", "uno:A4", "green", ["v40", "h10"]],
+    ["lcd1:SCL", "uno:A5", "blue", ["v50", "h20"]],
+
+    ["keypad1:R1", "uno:9", "orange", ["h-20", "v0"]],
+    ["keypad1:R2", "uno:8", "orange", ["h-30", "v10"]],
+    ["keypad1:R3", "uno:7", "orange", ["h-40", "v20"]],
+    ["keypad1:R4", "uno:6", "orange", ["h-50", "v30"]],
+    ["keypad1:C1", "uno:5", "yellow", ["h-60", "v40"]],
+    ["keypad1:C2", "uno:4", "yellow", ["h-70", "v50"]],
+    ["keypad1:C3", "uno:3", "yellow", ["h-80", "v60"]],
+    ["keypad1:C4", "uno:2", "yellow", ["h-90", "v70"]],
+
+    ["servo1:PWM", "uno:10", "purple", ["v0"]],
+    ["servo1:V+", "uno:5V", "red", ["v10"]],
+    ["servo1:GND", "uno:GND.2", "black", ["v20"]],
+
+    ["bz1:1", "uno:GND.1", "black", ["v10"]],
+    ["bz1:2", "uno:11", "cyan", ["v0"]],
+
+    ["led1:A", "uno:12", "red", ["v0"]],
+    ["led1:C", "uno:GND.1", "black", ["v10"]],
+
+    ["led2:A", "uno:13", "green", ["v0"]],
+    ["led2:C", "uno:GND.1", "black", ["v10"]],
+
+    ["led3:A", "uno:A0", "gold", ["v0"]],
+    ["led3:C", "uno:GND.1", "black", ["v10"]],
+
+    ["sw1:1", "uno:GND.2", "black", ["v0"]],
+    ["sw1:2", "uno:A1", "brown", ["v10"]],
+
+    ["pir1:VCC", "uno:5V", "red", ["v0"]],
+    ["pir1:OUT", "uno:A2", "magenta", ["v10"]],
+    ["pir1:GND", "uno:GND.2", "black", ["v20"]]
+  ],
+  "serialMonitor": { "display": "always", "newline": "lf" }
+}

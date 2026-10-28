@@ -1,0 +1,999 @@
+#include <Keypad.h>
+#include <Servo.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+// ================================================
+//  KEYPAD
+// ================================================
+
+const byte ROWS = 4;
+const byte COLS = 4;
+
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {9, 8, 7, 6};
+byte colPins[COLS] = {5, 4, 3, 2};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ================================================
+//  LCD (I2C) — A4 (SDA), A5 (SCL)
+// ================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================================================
+//  SERVO
+// ================================================
+
+Servo lockServo;
+const int servoPin = 10;
+
+// ================================================
+//  COMPONENTS
+// ================================================
+
+const int buzzerPin  = 11;
+const int redLED     = 12;
+const int greenLED   = 13;
+const int yellowLED  = A0;
+const int doorSensor = A1;
+const int pirSensor  = A2;
+
+// ================================================
+//  PASSWORDS
+// ================================================
+
+char userPass[11]  = "1234";     // Step 1 password
+char adminPass[11] = "0000";     // Admin password
+
+String enteredInput = "";
+
+// ================================================
+//  OTP SYSTEM
+// ================================================
+
+int generatedOTP = 0;            // Current OTP (4 digits)
+bool awaitingOTP = false;        // Waiting for OTP input?
+unsigned long otpGeneratedTime = 0;
+const unsigned long otpTimeout = 60000;  // OTP valid for 60 seconds
+
+// ================================================
+//  SECURITY & LOCKER STATE
+// ================================================
+
+int wrongAttempts = 0;
+const int maxAttempts = 3;
+
+bool unlocked = false;
+unsigned long unlockTime = 0;
+const unsigned long lockerWarningTime = 120000UL; // 2 minutes (120s) warning
+bool lockerWarningTriggered = false;
+
+const char DURESS_PIN[] = "9999";                 // Point 3: Secret Duress / Robbery Code
+
+bool lockedOut = false;
+unsigned long lockoutStart = 0;
+const unsigned long lockoutDuration = 30000UL; // 30s demo (7200000UL = 2hrs)
+
+bool doorAlerted = false;
+bool pirAlerted = false;
+
+unsigned long lastKeyTime = 0;
+
+// ================================================
+//  ACCESS HISTORY
+// ================================================
+
+const byte MAX_LOGS = 15;
+
+struct LogEntry {
+  char type;
+  unsigned long time;
+};
+
+LogEntry logs[MAX_LOGS];
+byte logCount = 0;
+
+// ================================================
+//  EEPROM
+// ================================================
+
+const int ADDR_FLAG  = 0;
+const int ADDR_USER  = 1;
+const int ADDR_ADMIN = 12;
+
+// ================================================
+//  SEND NOTIFICATION TO ADMIN (via Serial)
+// ================================================
+
+void notifyAdmin(const __FlashStringHelper* alertType, const __FlashStringHelper* message) {
+  Serial.println();
+  Serial.println(F("========================================"));
+  Serial.println(F("     *** ADMIN ALERT NOTIFICATION ***   "));
+  Serial.println(F("========================================"));
+  Serial.print(F("ALERT    : ")); Serial.println(alertType);
+  Serial.print(F("MESSAGE  : ")); Serial.println(message);
+  Serial.print(F("TIME     : ")); Serial.print(millis() / 1000); Serial.println(F(" seconds uptime"));
+  Serial.print(F("ATTEMPTS : ")); Serial.println(wrongAttempts);
+  Serial.println(F("STATUS   : >> Sent to admin's phone <<"));
+  Serial.println(F("========================================"));
+  Serial.println();
+}
+
+// ================================================
+//  SEND OTP TO USER (via Serial)
+// ================================================
+
+void sendOTPToUser(int otp) {
+  Serial.println();
+  Serial.println(F("========================================"));
+  Serial.println(F("      ** OTP SENT TO YOUR PHONE **      "));
+  Serial.println(F("========================================"));
+  Serial.print(F("YOUR OTP : ")); Serial.println(otp);
+  Serial.println(F("VALIDITY : 60 seconds (Enter code + #)"));
+  Serial.println(F("RESEND   : Press 'C' on keypad to resend"));
+  Serial.println(F("========================================"));
+  Serial.println();
+}
+
+// ================================================
+//  GENERATE OTP
+// ================================================
+
+int generateOTP() {
+  // Generate a random 4-digit number (1000-9999)
+  return random(1000, 10000);
+}
+
+// ================================================
+//  SETUP
+// ================================================
+
+void setup() {
+
+  Serial.begin(9600);
+
+  // Seed random number generator using noise from unconnected pin A3
+  randomSeed(analogRead(A3));
+
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redLED, OUTPUT);
+  pinMode(greenLED, OUTPUT);
+  pinMode(yellowLED, OUTPUT);
+  pinMode(doorSensor, INPUT_PULLUP);
+  pinMode(pirSensor, INPUT);
+
+  lockServo.attach(servoPin);
+  lockServo.write(0);          // Start in locked position immediately
+  delay(200);                  // Give servo time to reach 0°
+
+  loadPasswords();
+  lockDoor();
+
+  lcd.clear();
+  lcd.print(F("SMART LOCKER v3"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Safe Security"));
+
+  beep(100); delay(100);
+  beep(100); delay(100);
+  beep(150);
+
+  delay(1500);
+  showPasswordScreen();
+
+  Serial.println(F("========================================"));
+  Serial.println(F("     SMART LOCKER v3 -- OTP SYSTEM      "));
+  Serial.println(F("========================================"));
+  Serial.println(F("Step 1: Enter password (1234) + #       "));
+  Serial.println(F("Step 2: OTP sent to Serial Monitor      "));
+  Serial.println(F("Step 3: Enter OTP on keypad + #         "));
+  Serial.println(F("Lock  : Press # when done to lock locker"));
+  Serial.println(F("Panic : Enter 9999 + # (Duress Alarm)   "));
+  Serial.println(F("Resend: Press C to regenerate OTP       "));
+  Serial.println(F("Admin : Press D, then 0000 + #          "));
+  Serial.println(F("Clear : Press * to reset input          "));
+  Serial.println(F("========================================"));
+  Serial.println();
+}
+
+// ================================================
+//  MAIN LOOP
+// ================================================
+
+void loop() {
+
+  // POINT 2: Warning if locker is left open for >= 2 minutes (120 seconds)
+  if (unlocked && (millis() - unlockTime >= lockerWarningTime) && !lockerWarningTriggered) {
+    lockerWarningTriggered = true;
+
+    lcd.clear();
+    lcd.print(F("WARNING!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("LOCKER LEFT OPEN"));
+
+    notifyAdmin(F("LOCKER_LEFT_OPEN"), F("Locker left open > 2 min!"));
+
+    alarm();
+    delay(2000);
+
+    // Restore locker open screen
+    lcd.clear();
+    lcd.print(F("LOCKER OPEN"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Press # to Lock"));
+  }
+
+  // Lockout countdown
+  if (lockedOut) {
+    checkLockout();
+    return;
+  }
+
+  // OTP expiry check
+  if (awaitingOTP && millis() - otpGeneratedTime >= otpTimeout) {
+    awaitingOTP = false;
+    generatedOTP = 0;
+    enteredInput = "";
+    digitalWrite(yellowLED, LOW);
+
+    lcd.clear();
+    lcd.print(F("OTP EXPIRED!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Try again"));
+
+    errorBeep();
+
+    Serial.println(F("[SYSTEM] OTP expired. Request a new one."));
+
+    delay(2000);
+    showPasswordScreen();
+  }
+
+  // Sensor checks
+  checkDoorSensor();
+  checkPIR();
+
+  // Keypad input
+  char key = keypad.getKey();
+  if (key) {
+    lastKeyTime = millis();
+    handleKey(key);
+  }
+}
+
+// ================================================
+//  POINT 1: RELOCK LOCKER (Press #)
+// ================================================
+
+void relockLocker() {
+  unsigned long duration = (millis() - unlockTime) / 1000;
+  lockDoor();
+  lockerWarningTriggered = false;
+
+  lcd.clear();
+  lcd.print(F("LOCKER SECURED"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Used: "));
+  lcd.print(duration);
+  lcd.print(F("s"));
+
+  beep(200); delay(100); beep(200);
+
+  Serial.println();
+  Serial.println(F("========================================"));
+  Serial.println(F("        LOCKER SECURED & CLOSED         "));
+  Serial.println(F("========================================"));
+  Serial.print(F("Access Duration : ")); Serial.print(duration); Serial.println(F(" seconds"));
+  Serial.println(F("Status          : Vault locked successfully"));
+  Serial.println(F("========================================"));
+  Serial.println();
+
+  delay(2000);
+  showPasswordScreen();
+}
+
+// ================================================
+//  KEYPAD HANDLING
+// ================================================
+
+void handleKey(char key) {
+
+  // POINT 1: When locker is open, pressing # locks and secures it!
+  if (unlocked) {
+    if (key == '#') {
+      relockLocker();
+    } else {
+      lcd.setCursor(0, 1);
+      lcd.print(F("Press # to Lock "));
+      beep(100);
+    }
+    return;
+  }
+
+  // Admin login
+  if (key == 'D') {
+    adminLogin();
+    return;
+  }
+
+  // Regenerate / Resend OTP
+  if (key == 'C') {
+    if (awaitingOTP) {
+      resendOTP();
+    } else {
+      lcd.clear();
+      lcd.print(F("Enter Pass 1st!"));
+      beep(100);
+      delay(1000);
+      showPasswordScreen();
+    }
+    return;
+  }
+
+  // Clear input
+  if (key == '*') {
+    enteredInput = "";
+    if (awaitingOTP) {
+      awaitingOTP = false;
+      generatedOTP = 0;
+      digitalWrite(yellowLED, LOW);
+      Serial.println(F("[SYSTEM] OTP cancelled by user."));
+    }
+    showPasswordScreen();
+    return;
+  }
+
+  // Submit
+  if (key == '#') {
+    if (awaitingOTP) {
+      checkOTP();
+    } else {
+      checkPassword();
+    }
+    return;
+  }
+
+  // Digit input
+  if (key >= '0' && key <= '9') {
+    if (enteredInput.length() < 10) {
+      enteredInput += key;
+      beep(80);
+
+      lcd.setCursor(0, 1);
+      lcd.print(F("                "));
+      lcd.setCursor(0, 1);
+      for (unsigned int i = 0; i < enteredInput.length(); i++) {
+        lcd.print(F("*"));
+      }
+    }
+  }
+}
+
+// ================================================
+//  PASSWORD CHECK (Step 1)
+// ================================================
+
+void checkPassword() {
+
+  if (enteredInput.length() == 0) return;
+
+  // ------------------------------------------------
+  // POINT 3: DURESS / ROBBERY CODE (9999)
+  // ------------------------------------------------
+  if (enteredInput == String(DURESS_PIN)) {
+    enteredInput = "";
+    wrongAttempts = 0;
+    addLog('X'); // X = Duress event
+
+    // Silently unlock locker immediately (no OTP needed, victim is safe)
+    unlocked = true;
+    unlockTime = millis();
+    lockerWarningTriggered = false;
+
+    lockServo.write(90);
+    digitalWrite(redLED, LOW);
+    digitalWrite(greenLED, HIGH);
+
+    // On LCD: Show normal message so robber suspects nothing!
+    lcd.clear();
+    lcd.print(F("ACCESS GRANTED"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Locker Unlocked"));
+
+    // SILENT EMERGENCY ALERT to Admin/Security via Serial
+    Serial.println();
+    Serial.println(F("========================================"));
+    Serial.println(F("   CRITICAL EMERGENCY ALERT - DURESS    "));
+    Serial.println(F("========================================"));
+    Serial.println(F("ALERT    : DURESS_COERCION"));
+    Serial.println(F("MESSAGE  : LOCKER OPENED UNDER THREAT!"));
+    Serial.println(F("STATUS   : Silent robbery alarm active!"));
+    Serial.print(F("TIME     : ")); Serial.print(millis() / 1000); Serial.println(F(" seconds uptime"));
+    Serial.println(F("ACTION   : >> DISPATCHING POLICE / SECURITY <<"));
+    Serial.println(F("========================================"));
+    Serial.println();
+
+    delay(1500);
+    lcd.clear();
+    lcd.print(F("LOCKER OPEN"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Press # to Lock"));
+    return;
+  }
+
+  if (enteredInput == String(userPass)) {
+
+    // Password correct — generate OTP
+    wrongAttempts = 0;
+    addLog('P');
+    enteredInput = "";
+
+    // Generate random OTP
+    generatedOTP = generateOTP();
+    awaitingOTP = true;
+    otpGeneratedTime = millis();
+
+    // Show on LCD
+    lcd.clear();
+    lcd.print(F("Password OK!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("OTP sent >>>"));
+
+    digitalWrite(yellowLED, HIGH);
+
+    beep(100); delay(100); beep(100);
+
+    // Send OTP to user's "phone" (Serial Monitor)
+    sendOTPToUser(generatedOTP);
+
+    delay(1500);
+
+    // Show OTP entry screen
+    lcd.clear();
+    lcd.print(F("ENTER OTP:"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("C:Resend  *:Back"));
+
+  } else {
+
+    // Wrong password
+    wrongAttempts++;
+    addLog('F');
+    enteredInput = "";
+
+    lcd.clear();
+    lcd.print(F("WRONG PASSWORD"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Tries left: "));
+    lcd.print(maxAttempts - wrongAttempts);
+
+    errorBeep();
+
+    // Alert admin on 2nd wrong attempt
+    if (wrongAttempts >= 2) {
+      notifyAdmin(F("WRONG_PASSWORD"), F("Incorrect password entered! Lockout imminent."));
+    }
+
+    delay(1500);
+
+    if (wrongAttempts >= maxAttempts) {
+      startLockout();
+    } else {
+      showPasswordScreen();
+    }
+  }
+}
+
+// ================================================
+//  OTP CHECK (Step 2)
+// ================================================
+
+void checkOTP() {
+
+  if (enteredInput.length() == 0) return;
+
+  // Convert entered string to integer for comparison
+  long enteredOTP = enteredInput.toInt();
+
+  if (enteredOTP == generatedOTP) {
+
+    // OTP correct — unlock!
+    awaitingOTP = false;
+    generatedOTP = 0;
+    enteredInput = "";
+    wrongAttempts = 0;
+
+    digitalWrite(yellowLED, LOW);
+    addLog('S');
+
+    Serial.println(F("[SYSTEM] OTP verified successfully!"));
+
+    unlockDoor();
+
+  } else {
+
+    // Wrong OTP
+    wrongAttempts++;
+    addLog('F');
+    enteredInput = "";
+
+    lcd.clear();
+    lcd.print(F("WRONG OTP!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Tries left: "));
+    lcd.print(maxAttempts - wrongAttempts);
+
+    errorBeep();
+
+    Serial.print(F("[SYSTEM] Wrong OTP entered. Attempt "));
+    Serial.print(wrongAttempts);
+    Serial.print(F(" of "));
+    Serial.println(maxAttempts);
+
+    // Alert admin on 2nd wrong OTP
+    if (wrongAttempts >= 2) {
+      notifyAdmin(F("WRONG_OTP"), F("Wrong OTP entered! Someone has the password but not the OTP."));
+    }
+
+    delay(1500);
+
+    if (wrongAttempts >= maxAttempts) {
+      awaitingOTP = false;
+      generatedOTP = 0;
+      digitalWrite(yellowLED, LOW);
+      startLockout();
+    } else {
+      // Stay on OTP screen — same OTP is still valid
+      lcd.clear();
+      lcd.print(F("ENTER OTP:"));
+
+      // Show remaining time
+      unsigned long elapsed = (millis() - otpGeneratedTime) / 1000;
+      unsigned long remaining = (otpTimeout / 1000) - elapsed;
+      lcd.setCursor(0, 1);
+      lcd.print(F("Expires: "));
+      lcd.print(remaining);
+      lcd.print(F("s"));
+    }
+  }
+}
+
+// ================================================
+//  REGENERATE / RESEND OTP (Key C)
+// ================================================
+
+void resendOTP() {
+  if (!awaitingOTP) return;
+
+  enteredInput = "";
+  generatedOTP = generateOTP();
+  otpGeneratedTime = millis(); // Reset 60s expiration timer
+
+  lcd.clear();
+  lcd.print(F("NEW OTP SENT!"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Timer reset 60s"));
+
+  beep(100); delay(100); beep(100);
+
+  // Send newly regenerated OTP to Serial Monitor
+  sendOTPToUser(generatedOTP);
+
+  delay(1200);
+
+  lcd.clear();
+  lcd.print(F("ENTER OTP:"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("C:Resend  *:Back"));
+}
+
+// ================================================
+//  UNLOCK LOCKER
+// ================================================
+
+void unlockDoor() {
+
+  unlocked = true;
+  unlockTime = millis();
+  lockerWarningTriggered = false;
+
+  lockServo.write(90);
+  digitalWrite(redLED, LOW);
+  digitalWrite(greenLED, HIGH);
+
+  lcd.clear();
+  lcd.print(F("ACCESS GRANTED"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Locker Unlocked"));
+
+  beep(150); delay(150); beep(150);
+
+  notifyAdmin(F("ACCESS_GRANTED"), F("Locker unlocked via OTP"));
+
+  Serial.println(F("*** LOCKER UNLOCKED ***"));
+
+  delay(1500);
+
+  // Show stay-open instructions on LCD (Point 1)
+  lcd.clear();
+  lcd.print(F("LOCKER OPEN"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Press # to Lock"));
+}
+
+// ================================================
+//  LOCK LOCKER
+// ================================================
+
+void lockDoor() {
+  unlocked = false;
+  lockServo.write(0);
+  digitalWrite(redLED, HIGH);
+  digitalWrite(greenLED, LOW);
+  digitalWrite(yellowLED, LOW);
+  Serial.println(F("[SYSTEM] Locker locked & secured."));
+}
+
+// ================================================
+//  SECURITY LOCKOUT
+// ================================================
+
+void startLockout() {
+
+  lockedOut = true;
+  lockoutStart = millis();
+  wrongAttempts = 0;
+  enteredInput = "";
+  awaitingOTP = false;
+  generatedOTP = 0;
+
+  lockDoor();
+  addLog('L');
+
+  lcd.clear();
+  lcd.print(F("SYSTEM LOCKED!"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Lockout Active"));
+
+  // CRITICAL ALERT to admin
+  notifyAdmin(F("LOCKOUT"), F("CRITICAL: 3 wrong attempts! System locked for security."));
+
+  for (int i = 0; i < 5; i++) {
+    alarmBeep(); delay(200);
+  }
+}
+
+void checkLockout() {
+
+  if (millis() - lockoutStart >= lockoutDuration) {
+    lockedOut = false;
+    wrongAttempts = 0;
+    lcd.clear();
+    lcd.print(F("Lockout Over"));
+
+    notifyAdmin(F("LOCKOUT_ENDED"), F("Lockout period ended. System is accessible again."));
+
+    beep(200);
+    delay(1500);
+    showPasswordScreen();
+    return;
+  }
+
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate > 1000) {
+    lastUpdate = millis();
+    unsigned long rem = (lockoutDuration - (millis() - lockoutStart)) / 1000;
+
+    lcd.clear();
+    lcd.print(F("LOCKED OUT"));
+    lcd.setCursor(0, 1);
+    lcd.print(rem / 60); lcd.print(F("m "));
+    lcd.print(rem % 60); lcd.print(F("s"));
+
+    digitalWrite(yellowLED, !digitalRead(yellowLED));
+  }
+}
+
+// ================================================
+//  DOOR SENSOR
+// ================================================
+
+void checkDoorSensor() {
+  if (millis() < 6000) return;                        // Ignore during startup/boot
+  bool doorOpen = (digitalRead(doorSensor) == HIGH);  // HIGH = door open (switch slid right)
+
+  if (doorOpen && !unlocked && !doorAlerted) {
+    doorAlerted = true;
+    addLog('D');
+
+    lcd.clear();
+    lcd.print(F("LOCKER BREACH!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Tamper Detected"));
+
+    notifyAdmin(F("LOCKER_BREACH"), F("Locker forced open without authorization! Tamper alarm."));
+
+    alarm();
+    delay(2000);
+    showPasswordScreen();
+  }
+
+  if (!doorOpen) doorAlerted = false;
+}
+
+// ================================================
+//  PIR SENSOR
+// ================================================
+
+void checkPIR() {
+  if (unlocked) return;
+  if (millis() - lastKeyTime < 30000) return;
+
+  if (digitalRead(pirSensor) == HIGH && !pirAlerted) {
+    pirAlerted = true;
+    addLog('I');
+
+    lcd.clear();
+    lcd.print(F("INTRUSION!"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Motion Detected"));
+
+    notifyAdmin(F("INTRUSION"), F("Motion detected near the lock! No recent activity."));
+
+    alarm();
+    Serial.println(F("*** INTRUSION DETECTED ***"));
+    delay(3000);
+    showPasswordScreen();
+  }
+
+  if (digitalRead(pirSensor) == LOW) pirAlerted = false;
+}
+
+// ================================================
+//  ADMIN MODE
+// ================================================
+
+void adminLogin() {
+  String input = "";
+  lcd.clear();
+  lcd.print(F("ADMIN PIN:"));
+
+  while (true) {
+    char key = keypad.getKey();
+    if (!key) continue;
+    if (key == '*') { showPasswordScreen(); return; }
+    if (key == '#') break;
+    if (key >= '0' && key <= '9' && input.length() < 10) {
+      input += key;
+      lcd.setCursor(input.length() - 1, 1);
+      lcd.print(F("*"));
+    }
+  }
+
+  if (input == String(adminPass)) {
+    addLog('A');
+    lcd.clear();
+    lcd.print(F("Admin Access"));
+    delay(800);
+    adminMenu();
+  } else {
+    lcd.clear();
+    lcd.print(F("Admin Denied"));
+    errorBeep();
+    delay(1200);
+    showPasswordScreen();
+  }
+}
+
+void adminMenu() {
+  while (true) {
+    lcd.clear();
+    lcd.print(F("1:Pass 2:Admin"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("3:Log 4:Rst 5:Opn"));
+
+    Serial.println(F("\n--- ADMIN MENU ---"));
+    Serial.println(F("1 = Change Password"));
+    Serial.println(F("2 = Change Admin PIN"));
+    Serial.println(F("3 = View Logs"));
+    Serial.println(F("4 = Reset Security"));
+    Serial.println(F("5 = Admin Unlock"));
+    Serial.println(F("* = Exit"));
+
+    char key = waitForKey();
+
+    if (key == '1') changeCode(userPass, F("New Password:"));
+    else if (key == '2') changeCode(adminPass, F("New Admin PIN:"));
+    else if (key == '3') showLogs();
+    else if (key == '4') resetSecurity();
+    else if (key == '5') { addLog('S'); unlockDoor(); return; }
+    else if (key == '*') { showPasswordScreen(); return; }
+  }
+}
+
+void changeCode(char* target, const __FlashStringHelper* prompt) {
+  String newCode = "";
+  lcd.clear();
+  lcd.print(prompt);
+
+  while (true) {
+    char key = waitForKey();
+    if (key == '*') { lcd.clear(); lcd.print(F("Cancelled")); delay(800); return; }
+    if (key == '#') break;
+    if (key >= '0' && key <= '9' && newCode.length() < 10) {
+      newCode += key;
+      lcd.setCursor(newCode.length() - 1, 1);
+      lcd.print(key);
+    }
+  }
+
+  if (newCode.length() < 4) {
+    lcd.clear();
+    lcd.print(F("Min 4 digits!"));
+    errorBeep();
+    delay(1000);
+    return;
+  }
+
+  newCode.toCharArray(target, 11);
+  savePasswords();
+
+  lcd.clear();
+  lcd.print(F("Changed!"));
+  lcd.setCursor(0, 1);
+  lcd.print(target);
+  beep(150);
+  delay(1200);
+}
+
+void resetSecurity() {
+  wrongAttempts = 0;
+  lockedOut = false;
+  awaitingOTP = false;
+  generatedOTP = 0;
+  enteredInput = "";
+  digitalWrite(yellowLED, LOW);
+
+  lcd.clear();
+  lcd.print(F("Security Reset!"));
+  beep(150);
+  delay(1200);
+}
+
+char waitForKey() {
+  while (true) {
+    char key = keypad.getKey();
+    if (key) return key;
+  }
+}
+
+// ================================================
+//  ACCESS LOG
+// ================================================
+
+void addLog(char type) {
+  if (logCount < MAX_LOGS) {
+    logs[logCount].type = type;
+    logs[logCount].time = millis() / 1000;
+    logCount++;
+  } else {
+    for (byte i = 0; i < MAX_LOGS - 1; i++) logs[i] = logs[i + 1];
+    logs[MAX_LOGS - 1].type = type;
+    logs[MAX_LOGS - 1].time = millis() / 1000;
+  }
+}
+
+void showLogs() {
+  lcd.clear();
+  lcd.print(F("Logs -> Serial"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Check monitor"));
+
+  Serial.println(F("\n+-------- ACCESS LOG --------+"));
+  if (logCount == 0) Serial.println(F("|  No entries yet            |"));
+
+  for (byte i = 0; i < logCount; i++) {
+    Serial.print(F("| #")); Serial.print(i + 1);
+    Serial.print(F("  [")); Serial.print(logs[i].time); Serial.print(F("s]  "));
+    switch (logs[i].type) {
+      case 'S': Serial.println(F("UNLOCK SUCCESS  |")); break;
+      case 'P': Serial.println(F("PASSWORD OK     |")); break;
+      case 'F': Serial.println(F("FAILED ATTEMPT  |")); break;
+      case 'L': Serial.println(F("LOCKOUT         |")); break;
+      case 'A': Serial.println(F("ADMIN LOGIN     |")); break;
+      case 'D': Serial.println(F("DOOR ALERT      |")); break;
+      case 'I': Serial.println(F("INTRUSION       |")); break;
+      default:  Serial.println(F("UNKNOWN         |")); break;
+    }
+  }
+  Serial.println(F("+----------------------------------------+\n"));
+  delay(2000);
+}
+
+// ================================================
+//  EEPROM
+// ================================================
+
+void loadPasswords() {
+  if (EEPROM.read(ADDR_FLAG) == 0xAA) {
+    for (int i = 0; i < 11; i++) {
+      userPass[i]  = EEPROM.read(ADDR_USER + i);
+      adminPass[i] = EEPROM.read(ADDR_ADMIN + i);
+    }
+    Serial.println(F("[EEPROM] Passwords loaded."));
+  } else {
+    savePasswords();
+    EEPROM.write(ADDR_FLAG, 0xAA);
+    Serial.println(F("[EEPROM] Defaults saved."));
+  }
+}
+
+void savePasswords() {
+  for (int i = 0; i < 11; i++) {
+    EEPROM.update(ADDR_USER + i,  userPass[i]);
+    EEPROM.update(ADDR_ADMIN + i, adminPass[i]);
+  }
+}
+
+// ================================================
+//  BUZZER
+// ================================================
+
+void beep(int duration) {
+  tone(buzzerPin, 1200);
+  delay(duration);
+  noTone(buzzerPin);
+}
+
+void errorBeep() {
+  tone(buzzerPin, 350);
+  delay(400);
+  noTone(buzzerPin);
+}
+
+void alarmBeep() {
+  tone(buzzerPin, 1800);
+  delay(200);
+  noTone(buzzerPin);
+}
+
+void alarm() {
+  for (int i = 0; i < 4; i++) {
+    tone(buzzerPin, 1800);
+    delay(200);
+    noTone(buzzerPin);
+    delay(150);
+  }
+}
+
+// ================================================
+//  DISPLAY
+// ================================================
+
+void showPasswordScreen() {
+  lcd.clear();
+  enteredInput = "";
+
+  if (unlocked) {
+    lcd.print(F("LOCKER OPEN"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("Press # to Lock"));
+  } else if (awaitingOTP) {
+    lcd.print(F("ENTER OTP:"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("C:Resend  *:Back"));
+  } else {
+    lcd.print(F("ENTER PASSWORD:"));
+  }
+}
